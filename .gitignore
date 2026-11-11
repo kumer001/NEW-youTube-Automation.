@@ -1,0 +1,7 @@
+node_modules/
+out/
+public/audio/
+public/music.wav
+__pycache__/
+*.pyc
+client_secret*.json

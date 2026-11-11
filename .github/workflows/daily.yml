@@ -1,0 +1,75 @@
+name: Daily cartoon shorts
+
+on:
+  schedule:
+    - cron: '30 2 * * *' # 08:00 IST every day
+  workflow_dispatch:
+    inputs:
+      upload:
+        description: 'Upload to YouTube'
+        type: boolean
+        default: false
+      languages:
+        description: 'Comma-separated language codes (blank = all in config.json)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-shorts
+  cancel-in-progress: false
+
+jobs:
+  make:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: System packages (ffmpeg and fonts)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-noto-core fonts-noto-color-emoji
+          fc-cache -f
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          npm install --no-audit --no-fund
+
+      - name: Make and upload the videos
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          UPLOAD: ${{ github.event_name == 'schedule' || inputs.upload }}
+          LANGS: ${{ inputs.languages }}
+        run: python scripts/pipeline.py
+
+      - name: Keep the videos for 3 days
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: videos
+          path: out/*.mp4
+          retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Save topic history
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/history.json
+          git diff --cached --quiet || (git commit -m "chore: update topic history" && git push)

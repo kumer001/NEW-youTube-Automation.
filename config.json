@@ -1,0 +1,11 @@
+{
+  "gemini_model": "gemini-2.5-flash",
+  "privacy": "public",
+  "max_uploads_per_day": 6,
+  "languages": [
+    {"code": "en", "name": "English", "voice": "en-US-AndrewNeural"},
+    {"code": "hi", "name": "Hindi", "voice": "hi-IN-MadhurNeural"},
+    {"code": "bn", "name": "Bengali", "voice": "bn-IN-BashkarNeural"},
+    {"code": "es", "name": "Spanish", "voice": "es-MX-JorgeNeural"}
+  ]
+}
