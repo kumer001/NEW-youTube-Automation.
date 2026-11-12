@@ -1,5 +1,5 @@
 {
-  "gemini_model": "gemini-2.5-flash",
+  "gemini_model": "gemini-2.0-flash",
   "privacy": "public",
   "max_uploads_per_day": 6,
   "languages": [

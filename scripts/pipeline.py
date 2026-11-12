@@ -44,32 +44,77 @@ def clamp(v, lo, hi, default):
 
 
 def gemini(prompt, retries=4):
-    key = os.environ['GEMINI_API_KEY']
-    model = os.environ.get('GEMINI_MODEL') or CFG['gemini_model']
-    url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent'
+    key = os.environ.get('GEMINI_API_KEY', '').strip()
+    if not key:
+        raise ValueError('GEMINI_API_KEY environment variable is not set')
+
+    requested_model = os.environ.get('GEMINI_MODEL') or CFG.get('gemini_model', 'gemini-2.0-flash')
+    candidate_models = [requested_model, 'gemini-2.0-flash', 'gemini-1.5-flash']
+    models_to_try = []
+    for m in candidate_models:
+        if m and m not in models_to_try:
+            models_to_try.append(m)
+
     body = json.dumps({
         'contents': [{'parts': [{'text': prompt}]}],
         'generationConfig': {'temperature': 1.0, 'responseMimeType': 'application/json'},
     }).encode()
+
     last = None
-    for i in range(retries):
-        try:
-            req = urllib.request.Request(
-                url, data=body, headers={'Content-Type': 'application/json', 'x-goog-api-key': key}
-            )
-            with urllib.request.urlopen(req, timeout=120) as r:
-                data = json.load(r)
-            return json.loads(data['candidates'][0]['content']['parts'][0]['text'])
-        except Exception as e:  # noqa: BLE001
-            last = e
-            print(f'gemini retry {i + 1}: {e}', file=sys.stderr)
-            time.sleep(5 * (i + 1))
-    raise RuntimeError(f'Gemini failed: {last}')
+    for model in models_to_try:
+        url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent'
+        for i in range(retries):
+            try:
+                req = urllib.request.Request(
+                    url, data=body, headers={'Content-Type': 'application/json', 'x-goog-api-key': key}
+                )
+                with urllib.request.urlopen(req, timeout=120) as r:
+                    data = json.load(r)
+
+                candidates = data.get('candidates', [])
+                if not candidates:
+                    feedback = data.get('promptFeedback', {})
+                    raise ValueError(f'No candidates returned by Gemini: {feedback}')
+
+                parts = candidates[0].get('content', {}).get('parts', [])
+                if not parts:
+                    finish_reason = candidates[0].get('finishReason', 'UNKNOWN')
+                    raise ValueError(f'No parts in candidate, finishReason: {finish_reason}')
+
+                raw_text = parts[0].get('text', '').strip()
+                if raw_text.startswith('```'):
+                    raw_text = re.sub(r'^```(?:json)?\s*', '', raw_text)
+                    raw_text = re.sub(r'\s*```$', '', raw_text)
+
+                try:
+                    return json.loads(raw_text.strip())
+                except json.JSONDecodeError:
+                    match = re.search(r'(\{.*\})', raw_text, re.DOTALL)
+                    if match:
+                        return json.loads(match.group(1))
+                    raise
+            except urllib.error.HTTPError as e:
+                last = e
+                if e.code == 404:
+                    print(f'Model "{model}" not found (HTTP 404). Trying next model...', file=sys.stderr)
+                    break
+                print(f'gemini ({model}) retry {i + 1}: {e}', file=sys.stderr)
+                time.sleep(3 * (i + 1))
+            except Exception as e:  # noqa: BLE001
+                last = e
+                print(f'gemini ({model}) retry {i + 1}: {e}', file=sys.stderr)
+                time.sleep(3 * (i + 1))
+
+    raise RuntimeError(f'Gemini failed across models {models_to_try}: {last}')
 
 
 def clean_scene(s):
+    if not isinstance(s, dict):
+        raise ValueError(f'Expected scene dict, got {type(s)}')
     emos = []
     for e in (s.get('emojis') or [])[:4]:
+        if not isinstance(e, dict):
+            continue
         ch = str(e.get('char', '')).strip()
         if not ch:
             continue
@@ -124,20 +169,25 @@ The scenes array must have exactly {n} items, in the same order."""
 def make_master(recent, today):
     cat = CATEGORIES[today.toordinal() % len(CATEGORIES)]
     prompt = MASTER_PROMPT.format(cat=cat, recent='; '.join(recent[-60:]) or 'none', anims=ANIMS)
-    for _ in range(3):
+    for attempt in range(3):
         m = gemini(prompt)
+        if isinstance(m, list) and len(m) > 0 and isinstance(m[0], dict):
+            m = m[0]
+        if isinstance(m, dict) and 'scenes' not in m and 'story' in m and isinstance(m['story'], dict):
+            m = m['story']
         try:
-            scenes = [clean_scene(s) for s in m['scenes']]
+            raw_scenes = m.get('scenes', []) if isinstance(m, dict) else []
+            scenes = [clean_scene(s) for s in raw_scenes if isinstance(s, dict)]
             if 4 <= len(scenes) <= 8:
                 return {
-                    'topic': str(m.get('topic') or m['title']),
-                    'title': str(m['title']),
+                    'topic': str(m.get('topic') or m.get('title', 'Daily Short')),
+                    'title': str(m.get('title', 'Daily Cartoon Short')),
                     'description': str(m.get('description', '')),
                     'tags': [str(t) for t in m.get('tags', [])],
                     'scenes': scenes,
                 }
         except (KeyError, TypeError, ValueError) as e:
-            print('bad master, retrying:', e, file=sys.stderr)
+            print(f'bad master (attempt {attempt + 1}), retrying: {e}', file=sys.stderr)
     raise RuntimeError('could not get a valid story')
 
 
@@ -149,18 +199,23 @@ def localize(master, lang):
         'scenes': [{'narration': s['narration'], 'caption': s['caption']} for s in master['scenes']],
     }, ensure_ascii=False)
     prompt = LOCAL_PROMPT.format(lang=lang['name'], code=lang['code'], src=src, n=len(master['scenes']))
-    for _ in range(3):
+    for attempt in range(3):
         m = gemini(prompt)
+        if isinstance(m, list) and len(m) > 0 and isinstance(m[0], dict):
+            m = m[0]
+        if isinstance(m, dict) and 'scenes' not in m and 'story' in m and isinstance(m['story'], dict):
+            m = m['story']
         try:
-            if len(m['scenes']) == len(master['scenes']):
+            raw_scenes = m.get('scenes', []) if isinstance(m, dict) else []
+            if len(raw_scenes) == len(master['scenes']):
                 return {
-                    'title': str(m['title']),
-                    'description': str(m.get('description', '')),
-                    'tags': [str(t) for t in m.get('tags', [])],
-                    'texts': [(str(s['narration']).strip(), str(s['caption']).strip()) for s in m['scenes']],
+                    'title': str(m.get('title') or master['title']),
+                    'description': str(m.get('description') or master['description']),
+                    'tags': [str(t) for t in m.get('tags', master['tags'])],
+                    'texts': [(str(s.get('narration', '')).strip(), str(s.get('caption', '')).strip()) for s in raw_scenes],
                 }
         except (KeyError, TypeError) as e:
-            print('bad localization, retrying:', e, file=sys.stderr)
+            print(f"bad localization for {lang['code']} (attempt {attempt + 1}), retrying: {e}", file=sys.stderr)
     raise RuntimeError(f"could not localize to {lang['code']}")
 
 
@@ -171,9 +226,10 @@ async def _edge(text, voice, path):
 
 
 def tts(text, lang, voice, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
     try:
         asyncio.run(_edge(text, voice, path))
-        if path.stat().st_size < 1000:
+        if not path.exists() or path.stat().st_size < 1000:
             raise RuntimeError('empty audio')
     except Exception as e:  # noqa: BLE001
         print(f'edge-tts failed ({e}); falling back to gTTS', file=sys.stderr)
@@ -183,10 +239,18 @@ def tts(text, lang, voice, path):
 
 
 def duration(path):
-    out = subprocess.check_output(
-        ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', str(path)], text=True
-    )
-    return float(out.strip())
+    try:
+        out = subprocess.check_output(
+            ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', str(path)],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+        val = float(out.strip().splitlines()[0])
+        if val > 0:
+            return val
+    except Exception as e:
+        print(f'ffprobe warning for {path}: {e}', file=sys.stderr)
+    return 5.0
 
 
 def build_props(master, loc, lang):
@@ -214,6 +278,10 @@ def render(props, code):
 
 
 def main():
+    if not os.environ.get('GEMINI_API_KEY', '').strip():
+        print('Error: GEMINI_API_KEY environment variable is not set.', file=sys.stderr)
+        sys.exit(1)
+
     OUT.mkdir(exist_ok=True)
     (PUB / 'audio').mkdir(parents=True, exist_ok=True)
     today = datetime.date.today()
@@ -247,15 +315,18 @@ def main():
             print(f"[{code}] rendered {video.name}, {props['durationInFrames'] / FPS:.1f}s")
             done.append(code)
             if do_upload and uploads < CFG.get('max_uploads_per_day', 6):
-                title = (loc['title'] if loc else master['title']).strip()
-                if '#shorts' not in title.lower():
-                    title = f'{title[:88]} #Shorts'
-                desc = (loc['description'] if loc else master['description']).strip()
-                desc += '\n\n#Shorts #cartoon #story\nMade with AI-assisted tools.'
-                tags = (loc['tags'] if loc else master['tags']) + ['Shorts']
-                vid = upload(str(video), title, desc, tags, code, CFG.get('privacy', 'public'))
-                uploads += 1
-                print(f'[{code}] uploaded https://youtu.be/{vid}')
+                try:
+                    title = (loc['title'] if loc else master['title']).strip()
+                    if '#shorts' not in title.lower():
+                        title = f'{title[:88]} #Shorts'
+                    desc = (loc['description'] if loc else master['description']).strip()
+                    desc += '\n\n#Shorts #cartoon #story\nMade with AI-assisted tools.'
+                    tags = (loc['tags'] if loc else master['tags']) + ['Shorts']
+                    vid = upload(str(video), title, desc, tags, code, CFG.get('privacy', 'public'))
+                    uploads += 1
+                    print(f'[{code}] uploaded https://youtu.be/{vid}')
+                except Exception as up_err:
+                    print(f'[{code}] YouTube upload error: {up_err}', file=sys.stderr)
         except Exception as e:  # noqa: BLE001
             print(f'[{code}] FAILED: {e}', file=sys.stderr)
 

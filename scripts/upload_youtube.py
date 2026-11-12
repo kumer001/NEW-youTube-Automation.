@@ -42,5 +42,7 @@ def upload(path, title, description, tags, lang, privacy='public'):
     )
     resp = None
     while resp is None:
-        _, resp = req.next_chunk()
+        status, resp = req.next_chunk()
+        if status:
+            print(f'[{lang}] Upload progress: {int(status.progress() * 100)}%')
     return resp['id']
