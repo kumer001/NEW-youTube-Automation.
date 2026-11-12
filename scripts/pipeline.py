@@ -44,13 +44,40 @@ def clamp(v, lo, hi, default):
         return default
 
 
-def gemini(prompt, retries=4):
+def get_available_models(key):
+    try:
+        url = f'https://generativelanguage.googleapis.com/v1beta/models?key={urllib.parse.quote(key)}'
+        req = urllib.request.Request(url, headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.load(r)
+        models = []
+        for m in data.get('models', []):
+            methods = m.get('supportedGenerationMethods', [])
+            if 'generateContent' in methods:
+                name = m.get('name', '').replace('models/', '')
+                if name:
+                    models.append(name)
+        return models
+    except Exception as e:
+        print(f'Notice: could not list models ({e})', file=sys.stderr)
+        return []
+
+
+def gemini(prompt, retries=3):
     key = os.environ.get('GEMINI_API_KEY', '').strip().strip("'\" \r\n\t")
     if not key:
         raise ValueError('GEMINI_API_KEY environment variable is not set')
 
     requested_model = os.environ.get('GEMINI_MODEL') or CFG.get('gemini_model', 'gemini-3.8-flash')
-    candidate_models = [requested_model, 'gemini-3.8-flash', 'gemini-3-flash', 'gemini-2.5-flash', 'gemini-2.0-flash']
+    discovered = get_available_models(key)
+    if discovered:
+        print(f'Discovered available models: {discovered[:6]}', file=sys.stderr)
+
+    candidate_models = [requested_model, 'gemini-3.8-flash', 'gemini-3-flash', 'gemini-2.5-flash']
+    for m in discovered:
+        if ('flash' in m or 'pro' in m) and m not in candidate_models:
+            candidate_models.append(m)
+
     models_to_try = []
     for m in candidate_models:
         if m and m not in models_to_try:
@@ -64,63 +91,60 @@ def gemini(prompt, retries=4):
     last = None
     encoded_key = urllib.parse.quote(key)
     for model in models_to_try:
-        urls = [
-            f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={encoded_key}',
-            f'https://generativelanguage.googleapis.com/v1/models/{model}:generateContent?key={encoded_key}',
-        ]
-        model_succeeded = False
-        for url in urls:
-            if model_succeeded:
-                break
-            for i in range(retries):
+        url = f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={encoded_key}'
+        for i in range(retries):
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=body,
+                    headers={
+                        'Content-Type': 'application/json',
+                        'x-goog-api-key': key,
+                    },
+                )
+                with urllib.request.urlopen(req, timeout=35) as r:
+                    data = json.load(r)
+
+                candidates = data.get('candidates', [])
+                if not candidates:
+                    feedback = data.get('promptFeedback', {})
+                    raise ValueError(f'No candidates returned by Gemini: {feedback}')
+
+                parts = candidates[0].get('content', {}).get('parts', [])
+                if not parts:
+                    finish_reason = candidates[0].get('finishReason', 'UNKNOWN')
+                    raise ValueError(f'No parts in candidate, finishReason: {finish_reason}')
+
+                raw_text = parts[0].get('text', '').strip()
+                if raw_text.startswith('```'):
+                    raw_text = re.sub(r'^```(?:json)?\s*', '', raw_text)
+                    raw_text = re.sub(r'\s*```$', '', raw_text)
+
                 try:
-                    req = urllib.request.Request(
-                        url,
-                        data=body,
-                        headers={
-                            'Content-Type': 'application/json',
-                            'x-goog-api-key': key,
-                        },
-                    )
-                    with urllib.request.urlopen(req, timeout=120) as r:
-                        data = json.load(r)
-
-                    candidates = data.get('candidates', [])
-                    if not candidates:
-                        feedback = data.get('promptFeedback', {})
-                        raise ValueError(f'No candidates returned by Gemini: {feedback}')
-
-                    parts = candidates[0].get('content', {}).get('parts', [])
-                    if not parts:
-                        finish_reason = candidates[0].get('finishReason', 'UNKNOWN')
-                        raise ValueError(f'No parts in candidate, finishReason: {finish_reason}')
-
-                    raw_text = parts[0].get('text', '').strip()
-                    if raw_text.startswith('```'):
-                        raw_text = re.sub(r'^```(?:json)?\s*', '', raw_text)
-                        raw_text = re.sub(r'\s*```$', '', raw_text)
-
-                    try:
-                        return json.loads(raw_text.strip())
-                    except json.JSONDecodeError:
-                        match = re.search(r'(\{.*\})', raw_text, re.DOTALL)
-                        if match:
-                            return json.loads(match.group(1))
-                        raise
-                except urllib.error.HTTPError as e:
-                    last = e
-                    try:
-                        err_body = e.read().decode('utf-8', errors='replace')
-                    except Exception:
-                        err_body = str(e)
-                    print(f'gemini ({model}) HTTP {e.code}: {err_body}', file=sys.stderr)
-                    if e.code == 404:
-                        break
-                    time.sleep(3 * (i + 1))
-                except Exception as e:  # noqa: BLE001
-                    last = e
-                    print(f'gemini ({model}) retry {i + 1}: {e}', file=sys.stderr)
-                    time.sleep(3 * (i + 1))
+                    return json.loads(raw_text.strip())
+                except json.JSONDecodeError:
+                    match = re.search(r'(\{.*\})', raw_text, re.DOTALL)
+                    if match:
+                        return json.loads(match.group(1))
+                    raise
+            except urllib.error.HTTPError as e:
+                last = e
+                try:
+                    err_body = e.read().decode('utf-8', errors='replace')
+                except Exception:
+                    err_body = str(e)
+                print(f'gemini ({model}) HTTP {e.code}: {err_body}', file=sys.stderr)
+                if e.code in (404, 503) and i >= 1:
+                    print(f'Switching away from {model} due to HTTP {e.code}...', file=sys.stderr)
+                    break
+                time.sleep(4 * (i + 1))
+            except Exception as e:  # noqa: BLE001
+                last = e
+                print(f'gemini ({model}) retry {i + 1}: {e}', file=sys.stderr)
+                if 'timed out' in str(e).lower() and i >= 1:
+                    print(f'Timeout on {model}. Trying next model...', file=sys.stderr)
+                    break
+                time.sleep(3 * (i + 1))
 
     raise RuntimeError(f'Gemini failed across models {models_to_try}: {last}')
 
@@ -287,9 +311,17 @@ def render(props, code):
     props_path.write_text(json.dumps(props, ensure_ascii=False), encoding='utf-8')
     video = OUT / f'{code}.mp4'
     subprocess.run(
-        ['npx', 'remotion', 'render', 'src/index.ts', 'Story', str(video),
-         f'--props={props_path}', '--codec=h264', '--crf=24', '--log=warn'],
-        cwd=ROOT, check=True,
+        [
+            'npx', 'remotion', 'render', 'src/index.ts', 'Story', str(video),
+            f'--props={props_path}',
+            '--codec=h264',
+            '--crf=24',
+            '--concurrency=1',
+            '--gl=swangle',
+            '--log=info',
+        ],
+        cwd=ROOT,
+        check=True,
     )
     return video
 
